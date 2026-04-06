@@ -29,14 +29,14 @@ interface TimeSource {
 
 const TIME_SOURCES: TimeSource[] = [
   {
-    name: "worldtimeapi",
-    url: "https://worldtimeapi.org/api/timezone/Etc/UTC",
-    parse: (d) => { try { return Math.round(new Date(JSON.parse(d).utc_datetime).getTime()); } catch { return null; } },
-  },
-  {
-    name: "timeapi",
+    name: "timeapi.io",
     url: "https://timeapi.io/api/time/current/zone?timeZone=UTC",
     parse: (d) => { try { const j = JSON.parse(d); return new Date(j.dateTime + "Z").getTime(); } catch { return null; } },
+  },
+  {
+    name: "worldtimeapi",
+    url: "http://worldtimeapi.org/api/timezone/Etc/UTC",
+    parse: (d) => { try { return Math.round(new Date(JSON.parse(d).utc_datetime).getTime()); } catch { return null; } },
   },
 ];
 
@@ -53,7 +53,7 @@ async function trustedNow(): Promise<number> {
   const promises = TIME_SOURCES.map(async (src) => {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 3_000);
+      const timeout = setTimeout(() => controller.abort(), 2_000);
       const resp = await fetch(src.url, { signal: controller.signal });
       clearTimeout(timeout);
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -553,7 +553,7 @@ async function unseal() {
 </body>
 </html>`;
 
-export default async function handler(req: Request): Request {
+export default async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);
   const path = url.pathname;
 
@@ -564,7 +564,7 @@ export default async function handler(req: Request): Request {
   }
 
   // POST /seal -- receive key from client, store in vault
-  if (path === "seal" && req.method === "POST") {
+  if (path === "/seal" && req.method === "POST") {
     const body = await req.json();
     const { key, iv, releaseTime } = body;
     if (!key || !iv || !releaseTime) {
@@ -583,7 +583,7 @@ export default async function handler(req: Request): Request {
   }
 
   // GET /unseal/:id -- release key if time is up
-  const match = path.match(/^unseal\/([a-f0-9]+)$/);
+  const match = path.match(/^\/unseal\/([a-f0-9]+)$/);
   if (match && req.method === "GET") {
     const id = match[1];
     const secret = vault.get(id);
@@ -610,7 +610,7 @@ export default async function handler(req: Request): Request {
   }
 
   // GET /status -- vault stats
-  if (path === "status" && req.method === "GET") {
+  if (path === "/status" && req.method === "GET") {
     return Response.json({
       stored: vault.size,
       entries: [...vault.entries()].map(([id, s]) => ({
@@ -624,7 +624,7 @@ export default async function handler(req: Request): Request {
 
 
   // GET /time -- expose current trusted time for verification
-  if (path === "time" && req.method === "GET") {
+  if (path === "/time" && req.method === "GET") {
     const now = await trustedNow();
     return Response.json({
       time: now,
@@ -633,4 +633,12 @@ export default async function handler(req: Request): Request {
     });
   }
   return new Response("timelock: see / for UI", { status: 404 });
+}
+
+
+// Standalone server (for local dev / non-Deno-Deploy environments)
+if (import.meta.main) {
+  const PORT = parseInt(Deno.env.get("PORT") || "3000");
+  Deno.serve({ port: PORT }, handler);
+  console.log(`Timelock server listening on :${PORT}`);
 }
