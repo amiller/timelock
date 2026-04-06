@@ -555,7 +555,7 @@ async function unseal() {
 
 export default async function handler(req: Request): Request {
   const url = new URL(req.url);
-  const path = url.pathname.replace(/^\/timelock\/?/, "") || "/";
+  const path = url.pathname;
 
   if (path === "/" && req.method === "GET") {
     return new Response(HTML, {
