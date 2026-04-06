@@ -19,6 +19,78 @@ interface StoredSecret {
   createdAt: number;
 }
 
+
+// Trusted time: fetch from multiple time servers, use median
+interface TimeSource {
+  name: string;
+  url: string;
+  parse: (data: string) => number | null;
+}
+
+const TIME_SOURCES: TimeSource[] = [
+  {
+    name: "worldtimeapi",
+    url: "https://worldtimeapi.org/api/timezone/Etc/UTC",
+    parse: (d) => { try { return Math.round(new Date(JSON.parse(d).utc_datetime).getTime()); } catch { return null; } },
+  },
+  {
+    name: "timeapi",
+    url: "https://timeapi.io/api/time/current/zone?timeZone=UTC",
+    parse: (d) => { try { const j = JSON.parse(d); return new Date(j.dateTime + "Z").getTime(); } catch { return null; } },
+  },
+];
+
+let cachedTime: number | null = null;
+let cacheExpiry = 0;
+const TIME_CACHE_MS = 5_000; // refresh every 5s
+
+async function trustedNow(): Promise<number> {
+  if (cachedTime && Date.now() < cacheExpiry) return cachedTime;
+
+  const results: number[] = [];
+  const errors: string[] = [];
+
+  const promises = TIME_SOURCES.map(async (src) => {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 3_000);
+      const resp = await fetch(src.url, { signal: controller.signal });
+      clearTimeout(timeout);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const text = await resp.text();
+      const t = src.parse(text);
+      if (t && t > 1_000_000_000_000) { // sanity: after year 2001 in ms
+        results.push(t);
+      }
+    } catch (e: any) {
+      errors.push(`${src.name}: ${e.message}`);
+    }
+  });
+
+  await Promise.allSettled(promises);
+
+  if (results.length === 0) {
+    console.error("All time sources failed:", errors.join("; "));
+    // Fallback to system clock (less trustworthy)
+    return Date.now();
+  }
+
+  // Use median for robustness
+  results.sort((a, b) => a - b);
+  const median = results[Math.floor(results.length / 2)];
+  cachedTime = median;
+  cacheExpiry = Date.now() + TIME_CACHE_MS;
+
+  if (results.length > 1) {
+    const skew = Math.abs(results[0] - results[results.length - 1]);
+    if (skew > 10_000) {
+      console.warn(`Time source skew: ${skew}ms across ${results.length} sources`, errors);
+    }
+  }
+
+  return median;
+}
+
 // In-memory store (demo only - would use persistent storage in production)
 const vault = new Map<string, StoredSecret>();
 
@@ -312,7 +384,7 @@ const HTML = `<!DOCTYPE html>
   <div class="attestation">
     <strong>TEE Attestation:</strong> This enclave runs inside a Phala dstack Trusted Execution Environment.
     The decryption key cannot be accessed by anyone -- including the cloud provider.
-    Time enforcement is cryptographically verified at the hardware level.
+    Time is fetched from multiple public time servers. The TEE attests this code runs unchanged inside the enclave.
   </div>
 
   <div class="how-it-works">
@@ -427,6 +499,7 @@ async function unseal() {
     const data = await resp.json();
 
     if (data.error) return showError('unseal-error', data.error);
+      if (data.serverTime) console.log('TEE trusted time:', new Date(data.serverTime).toISOString());
 
     if (data.released) {
       // We have the key! But we need the ciphertext too.
@@ -517,14 +590,18 @@ export default async function handler(req: Request): Request {
     if (!secret) {
       return Response.json({ error: "not found" }, { status: 404 });
     }
-    if (Date.now() < secret.releaseTime) {
-      return Response.json({
+    const now = await trustedNow();
+    if (now < secret.releaseTime) {
+      const now = await trustedNow();
+    return Response.json({
         released: false,
         releaseTime: secret.releaseTime,
+        serverTime: now,
       });
     }
     // Time is up! Return the key, then delete from vault
     vault.delete(id);
+    console.log(`Released ${id} at trusted time ${now}`);
     return Response.json({
       released: true,
       key: secret.key,
@@ -545,5 +622,15 @@ export default async function handler(req: Request): Request {
     });
   }
 
+
+  // GET /time -- expose current trusted time for verification
+  if (path === "time" && req.method === "GET") {
+    const now = await trustedNow();
+    return Response.json({
+      time: now,
+      iso: new Date(now).toISOString(),
+      sources: TIME_SOURCES.map(s => s.name),
+    });
+  }
   return new Response("timelock: see / for UI", { status: 404 });
 }
