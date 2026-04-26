@@ -35,7 +35,7 @@ const TIME_SOURCES: TimeSource[] = [
   },
   {
     name: "worldtimeapi",
-    url: "http://worldtimeapi.org/api/timezone/Etc/UTC",
+    url: "https://worldtimeapi.org/api/timezone/Etc/UTC",
     parse: (d) => { try { return Math.round(new Date(JSON.parse(d).utc_datetime).getTime()); } catch { return null; } },
   },
 ];
@@ -70,9 +70,7 @@ async function trustedNow(): Promise<number> {
   await Promise.allSettled(promises);
 
   if (results.length === 0) {
-    console.error("All time sources failed:", errors.join("; "));
-    // Fallback to system clock (less trustworthy)
-    return Date.now();
+    throw new Error("trusted time unavailable: " + errors.join("; "));
   }
 
   // Use median for robustness
@@ -106,12 +104,6 @@ function genId(): string {
   const bytes = new Uint8Array(16);
   crypto.getRandomValues(bytes);
   return [...bytes].map(b => b.toString(16).padStart(2, "0")).join("");
-}
-
-function checkAuth(req: Request): boolean {
-  const token = Deno.env.get("TIMLOCK_TOKEN") || "";
-  if (!token) return true;
-  return req.headers.get("authorization") === "Bearer " + token;
 }
 
 const HTML = `<!DOCTYPE html>
@@ -592,8 +584,7 @@ export default async function handler(req: Request): Promise<Response> {
     }
     const now = await trustedNow();
     if (now < secret.releaseTime) {
-      const now = await trustedNow();
-    return Response.json({
+      return Response.json({
         released: false,
         releaseTime: secret.releaseTime,
         serverTime: now,
@@ -608,20 +599,6 @@ export default async function handler(req: Request): Promise<Response> {
       iv: secret.iv,
     });
   }
-
-  // GET /status -- vault stats
-  if (path === "/status" && req.method === "GET") {
-    return Response.json({
-      stored: vault.size,
-      entries: [...vault.entries()].map(([id, s]) => ({
-        id,
-        releaseTime: s.releaseTime,
-        createdAt: s.createdAt,
-        released: Date.now() >= s.releaseTime,
-      })),
-    });
-  }
-
 
   // GET /time -- expose current trusted time for verification
   if (path === "/time" && req.method === "GET") {
