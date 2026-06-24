@@ -346,12 +346,9 @@ const HTML = `<!DOCTYPE html>
     <div id="seal-error" class="error"></div>
 
     <div id="seal-output" class="output">
-      <div class="label">Sealed Message</div>
+      <div class="label">Sealed Message — save this; you need it to unseal</div>
       <div id="sealed-text"></div>
       <button class="copy-btn" onclick="copyText('sealed-text')">Copy</button>
-      <div class="label" style="margin-top:1rem">Secret ID</div>
-      <div id="sealed-id"></div>
-      <button class="copy-btn" onclick="copyText('sealed-id')">Copy</button>
       <div style="margin-top:0.8rem;font-size:0.8rem;color:#888">
         Release: <span id="release-display"></span>
       </div>
@@ -359,8 +356,8 @@ const HTML = `<!DOCTYPE html>
   </div>
 
   <div id="unseal-panel" class="panel">
-    <label>Secret ID</label>
-    <input id="secret-id" placeholder="Paste the secret ID...">
+    <label>Sealed Message</label>
+    <textarea id="sealed-input" placeholder="Paste your sealed message (the JSON you saved when sealing)..."></textarea>
 
     <button class="btn-primary" onclick="unseal()">Unseal</button>
     <div id="unseal-error" class="error"></div>
@@ -430,7 +427,7 @@ async function seal() {
 
   try {
     // Generate AES-256 key
-    const key = await crypto.subtle.generateKey({ name: 'AES-GCM' }, true, ['encrypt', 'decrypt']);
+    const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const encoded = new TextEncoder().encode(msg);
 
@@ -465,12 +462,8 @@ async function seal() {
     const sealed = JSON.stringify({ id: data.id, ct: ctB64 });
 
     document.getElementById('sealed-text').textContent = sealed;
-    document.getElementById('sealed-id').textContent = data.id;
     document.getElementById('release-display').textContent = new Date(releaseTime).toLocaleString();
     document.getElementById('seal-output').classList.add('show');
-
-    // Clear key from memory
-    await crypto.subtle.deleteKey(key);
   } catch (e) {
     showError('seal-error', e.message);
   }
@@ -478,65 +471,50 @@ async function seal() {
 
 let countdownInterval = null;
 
+async function decryptSealed(data, parsed) {
+  const keyBytes = Uint8Array.from(atob(data.key), c => c.charCodeAt(0));
+  const ivBytes = Uint8Array.from(atob(data.iv), c => c.charCodeAt(0));
+  const ctBytes = Uint8Array.from(atob(parsed.ct), c => c.charCodeAt(0));
+  const cryptoKey = await crypto.subtle.importKey('raw', keyBytes, { name: 'AES-GCM' }, false, ['decrypt']);
+  const plainBuffer = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ivBytes }, cryptoKey, ctBytes);
+  document.getElementById('decrypt-result').textContent = new TextDecoder().decode(plainBuffer);
+  document.getElementById('decrypt-result').classList.add('show');
+  document.getElementById('countdown').classList.remove('show');
+}
+
 async function unseal() {
-  const id = document.getElementById('secret-id').value.trim();
-  if (!id) return showError('unseal-error', 'Enter a Secret ID');
+  const raw = document.getElementById('sealed-input').value.trim();
+  if (!raw) return showError('unseal-error', 'Paste your sealed message');
+
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch { return showError('unseal-error', 'Invalid sealed message JSON'); }
+  const id = parsed.id;
+  if (!id || !parsed.ct) return showError('unseal-error', 'Sealed message missing id or ct');
 
   if (countdownInterval) clearInterval(countdownInterval);
   document.getElementById('decrypt-result').classList.remove('show');
 
-  try {
-    // Ask TEE for the key
+  // Returns true when polling should stop (released or hard error).
+  const poll = async () => {
     const resp = await fetch(BASE + '/unseal/' + id);
     const data = await resp.json();
+    if (data.error) { showError('unseal-error', data.error); return true; }
+    if (data.serverTime) console.log('TEE trusted time:', new Date(data.serverTime).toISOString());
+    if (data.released) { await decryptSealed(data, parsed); return true; }
+    document.getElementById('countdown').classList.add('show');
+    const remaining = Math.max(0, data.releaseTime - Date.now());
+    const mins = Math.floor(remaining / 60000), secs = Math.floor((remaining % 60000) / 1000);
+    document.getElementById('countdown-time').textContent =
+      String(mins).padStart(2, '0') + ':' + String(secs).padStart(2, '0');
+    return false;
+  };
 
-    if (data.error) return showError('unseal-error', data.error);
-      if (data.serverTime) console.log('TEE trusted time:', new Date(data.serverTime).toISOString());
-
-    if (data.released) {
-      // We have the key! But we need the ciphertext too.
-      // Prompt user for sealed message
-      const sealed = prompt('Paste your sealed message (the JSON with id and ct):');
-      if (!sealed) return;
-
-      let parsed;
-      try { parsed = JSON.parse(sealed); } catch { return showError('unseal-error', 'Invalid sealed message JSON'); }
-
-      if (parsed.id !== id) return showError('unseal-error', 'Secret ID mismatch');
-
-      const keyBytes = Uint8Array.from(atob(data.key), c => c.charCodeAt(0));
-      const ivBytes = Uint8Array.from(atob(data.iv), c => c.charCodeAt(0));
-      const ctBytes = Uint8Array.from(atob(parsed.ct), c => c.charCodeAt(0));
-
-      const cryptoKey = await crypto.subtle.importKey('raw', keyBytes, { name: 'AES-GCM' }, false, ['decrypt']);
-      const plainBuffer = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ivBytes }, cryptoKey, ctBytes);
-      const plaintext = new TextDecoder().decode(plainBuffer);
-
-      document.getElementById('decrypt-result').textContent = plaintext;
-      document.getElementById('decrypt-result').classList.add('show');
-      document.getElementById('countdown').classList.remove('show');
-    } else {
-      // Not yet released
-      const cd = document.getElementById('countdown');
-      cd.classList.add('show');
-
-      const updateCountdown = () => {
-        const remaining = data.releaseTime - Date.now();
-        if (remaining <= 0) {
-          clearInterval(countdownInterval);
-          cd.classList.remove('show');
-          unseal(); // auto-retry
-          return;
-        }
-        const mins = Math.floor(remaining / 60000);
-        const secs = Math.floor((remaining % 60000) / 1000);
-        document.getElementById('countdown-time').textContent =
-          String(mins).padStart(2, '0') + ':' + String(secs).padStart(2, '0');
-      };
-
-      updateCountdown();
-      countdownInterval = setInterval(updateCountdown, 1000);
-    }
+  try {
+    if (await poll()) return;
+    countdownInterval = setInterval(() => {
+      poll().then(done => { if (done) clearInterval(countdownInterval); })
+            .catch(e => { clearInterval(countdownInterval); showError('unseal-error', e.message); });
+    }, 1000);
   } catch (e) {
     showError('unseal-error', e.message);
   }
