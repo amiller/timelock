@@ -273,6 +273,39 @@ const HTML = `<!DOCTYPE html>
     color: #92400e;
   }
   .attestation strong { color: #78350f; }
+  .claim {
+    margin-top: 2rem;
+    padding: 1rem 1.2rem;
+    background: #ecfdf5;
+    border: 1.5px solid #a7f3d0;
+    border-radius: 8px;
+    font-size: 0.9rem;
+    color: #065f46;
+    line-height: 1.6;
+  }
+  .claim strong { color: #047857; }
+  .claim .only { font-weight: 600; text-decoration: underline; text-decoration-color: #6ee7b7; }
+  .verify-toggle {
+    width: 100%; margin-top: 0.8rem; padding: 0.7rem;
+    background: #f0fdf4; border: 1.5px solid #a7f3d0; border-radius: 8px;
+    color: #047857; font-weight: 600; font-size: 0.85rem; cursor: pointer;
+  }
+  .verify-toggle:hover { background: #dcfce7; }
+  .chain { margin-top: 0.8rem; display: none; }
+  .chain.show { display: block; }
+  .step {
+    padding: 0.7rem 0.9rem; margin-bottom: 0.5rem;
+    border-left: 3px solid #d4d4cf; background: #fafaf8; border-radius: 0 6px 6px 0;
+    font-size: 0.83rem; color: #444;
+  }
+  .step.ok { border-left-color: #059669; }
+  .step.fail { border-left-color: #dc2626; background: #fef2f2; }
+  .step.pending { border-left-color: #d4d4cf; opacity: 0.7; }
+  .step .label { font-weight: 600; color: #1a1a1a; display: block; margin-bottom: 0.2rem; }
+  .step .val { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.78rem; word-break: break-all; color: #059669; }
+  .step .val.bad { color: #dc2626; }
+  .step a { color: #059669; text-decoration: underline; }
+  .step .note { color: #888; font-size: 0.76rem; margin-top: 0.25rem; }
   .decrypt-result {
     margin-top: 1rem;
     padding: 1rem;
@@ -370,11 +403,15 @@ const HTML = `<!DOCTYPE html>
     <div id="decrypt-result" class="decrypt-result"></div>
   </div>
 
-  <div class="attestation">
-    <strong>TEE Attestation:</strong> This enclave runs inside a Phala dstack Trusted Execution Environment.
-    The decryption key cannot be accessed by anyone -- including the cloud provider.
-    Time is fetched from multiple public time servers. The TEE attests this code runs unchanged inside the enclave.
+  <div class="claim">
+    <strong>What this app can and cannot do with your data.</strong>
+    It holds your decryption key and releases it <strong>only</strong> after your chosen time —
+    <span class="only">and nothing else</span>. It never receives your message (the ciphertext stays
+    in your browser; only the key is sent here). It cannot release the key early, and it cannot be
+    made to by its operator. Every clause below is checkable, live — not asserted.
   </div>
+  <button class="verify-toggle" onclick="verifyPromise()">🔍 Verify this promise &mdash; walk the chain live</button>
+  <div id="chain" class="chain"></div>
 
   <div class="how-it-works">
     <h3>How it works</h3>
@@ -416,6 +453,94 @@ function showError(id, msg) {
   el.textContent = msg;
   el.classList.add('show');
   setTimeout(() => el.classList.remove('show'), 5000);
+}
+
+const APP = BASE.replace(/^\\//, '') || 'timelock';
+const DAEMON = location.origin;
+const REPO = 'https://github.com/amiller/timelock';
+
+function stepHTML(cls, label, valHTML, note) {
+  return '<div class="step ' + cls + '"><span class="label">' + label + '</span>' +
+    (valHTML || '') + (note ? '<div class="note">' + note + '</div>' : '') + '</div>';
+}
+
+async function verifyPromise() {
+  const chain = document.getElementById('chain');
+  chain.classList.add('show');
+  const steps = [
+    stepHTML('ok', '1 &middot; This is the app you are using', '<span class="val">' + DAEMON + BASE + '/</span>', 'The page in your address bar right now.'),
+    stepHTML('pending', '2 &middot; It runs inside a measured TEE', 'checking hardware quote…'),
+    stepHTML('pending', '3 &middot; …hosted by daemon build', 'checking version…'),
+    stepHTML('pending', '4 &middot; …running exactly this source code', 'checking source binding…'),
+    stepHTML('pending', '5 &middot; …and the release is enforced here', 'reading the trusted clock…'),
+  ];
+  const render = () => { chain.innerHTML = steps.join(''); };
+  render();
+
+  // Steps 2 & 4 share the RFC 0020 evidence bundle (quote + source binding)
+  let bundle = null;
+  try {
+    const r = await fetch(DAEMON + '/_api/verification/' + APP);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    bundle = await r.json();
+    const q = (bundle.platform_quote && bundle.platform_quote.quote) || '';
+    if (!q) throw new Error('no quote in evidence bundle');
+    steps[1] = stepHTML('ok', '2 &middot; It runs inside a measured TEE',
+      '<span class="val">' + q.slice(0, 48) + '…</span>',
+      'A hardware-signed measurement of the enclave. <a href="' + DAEMON + '/_api/verification/' + APP + '" target="_blank">evidence bundle</a> &middot; <a href="' + DAEMON + '/_api/verification/' + APP + '?format=html" target="_blank">rendered verifier</a>');
+  } catch (e) {
+    steps[1] = stepHTML('fail', '2 &middot; It runs inside a measured TEE', '<span class="val bad">could not fetch quote: ' + e.message + '</span>', 'This app does not currently expose an attestation — treat the promise as unverified.');
+  }
+  render();
+
+  // Step 3: daemon build commit
+  try {
+    const r = await fetch(DAEMON + '/_api/version');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    const c = d.commit || '';
+    if (!c) throw new Error('no commit');
+    steps[2] = stepHTML('ok', '3 &middot; …hosted by daemon build',
+      '<span class="val">' + c + '</span>',
+      'The exact host daemon commit. <a href="https://github.com/amiller/dstack-webhost/commit/' + c + '" target="_blank">view on GitHub</a>');
+  } catch (e) {
+    steps[2] = stepHTML('fail', '3 &middot; …hosted by daemon build', '<span class="val bad">' + e.message + '</span>', 'Host version endpoint unreachable.');
+  }
+  render();
+
+  // Step 4: source binding (tree hash)
+  try {
+    const r = await fetch(DAEMON + '/_api/projects/' + APP);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    const th = d.tree_hash || '';
+    const src = d.source || '';
+    if (!th) throw new Error('no tree_hash — app is not source-pinned (unattestable)');
+    steps[3] = stepHTML('ok', '4 &middot; …running exactly this source code',
+      '<span class="val">tree ' + th.slice(0, 24) + '…</span>',
+      'The daemon pins the running code to this git tree hash.' +
+      (src ? ' Source: <a href="' + src + '" target="_blank">' + src + '</a>.' : '') +
+      ' Compare with <span class="val">git rev-parse HEAD^{tree}</span> in the repo.');
+  } catch (e) {
+    steps[3] = stepHTML('fail', '4 &middot; …running exactly this source code', '<span class="val bad">' + e.message + '</span>', 'Without a pinned source, nothing binds the running code to a claim.');
+  }
+  render();
+
+  // Step 5: the enforcement line + live trusted clock
+  try {
+    const r = await fetch(BASE + '/time');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    steps[4] = stepHTML('ok', '5 &middot; …and the release is enforced here',
+      '<span class="val">trusted clock: ' + d.iso + '</span>',
+      'The key is withheld while <span class="val">now &lt; releaseTime</span> — the guard in ' +
+      '<a href="' + REPO + '/blob/main/server.ts" target="_blank">server.ts</a> ' +
+      '(GET /unseal/:id returns released:false until the trusted time passes). ' +
+      'Clock median of: ' + (d.sources || []).join(', ') + '.');
+  } catch (e) {
+    steps[4] = stepHTML('fail', '5 &middot; …and the release is enforced here', '<span class="val bad">' + e.message + '</span>', 'Trusted clock endpoint unreachable.');
+  }
+  render();
 }
 
 async function seal() {
